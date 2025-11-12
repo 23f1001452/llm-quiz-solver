@@ -21,3 +21,12 @@ Thumbs.db
 *.xlsx
 data/
 temp/
+
+# Test files (don't push to GitHub)
+test_*.py
+diagnose.py
+mock_quiz_server.py
+setup_verification.py
+tests/
+
+# Keep only essential files
