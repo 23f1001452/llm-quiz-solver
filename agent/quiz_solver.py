@@ -94,9 +94,10 @@ class QuizSolver:
             
             # Step 4: Submit answer
             submit_url = instructions.get("submit_url")
-            if not submit_url:
-                raise ValueError("No submit_url found in instructions")
-            
+            if not submit_url or submit_url.lower() == "none":
+                raise ValueError(f"LLM returned invalid submit_url: {submit_url}")
+            if "origin" in submit_url or "+" in submit_url:
+                raise ValueError(f"Invalid submit_url guessed by LLM: {submit_url}")
             from urllib.parse import urljoin
 
             # Convert relative submit URL to absolute
@@ -129,7 +130,10 @@ Return ONLY a valid JSON object (no explanation, no markdown, no extra text) wit
 - data_source: URL or description of data to fetch (or "none" if not needed)
 - analysis_type: what kind of analysis (sum, filter, visualization, etc.)
 - answer_format: expected format (number, string, json, base64, etc.)
-- submit_url: where to POST the answer
+- submit_url: EXACTLY the value found in the HTML form/action or API script.
+  DO NOT guess. DO NOT invent text like "origin + /submit".
+  If submit URL is relative (e.g. "/submit"), return it exactly as-is.
+  If not present in HTML, return "none".
 - payload_template: the JSON structure for submission
 
 Response must be pure JSON only, starting with {{ and ending with }}.
