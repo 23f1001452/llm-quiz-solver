@@ -97,6 +97,12 @@ class QuizSolver:
             if not submit_url:
                 raise ValueError("No submit_url found in instructions")
             
+            from urllib.parse import urljoin
+
+            # Convert relative submit URL to absolute
+            submit_url = urljoin(quiz_url, submit_url)
+
+            
             logger.info(f"Submitting answer to: {submit_url}")
             result = await self.submit_answer(submit_url, answer)
             
