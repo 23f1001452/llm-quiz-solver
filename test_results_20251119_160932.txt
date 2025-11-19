@@ -1,0 +1,6 @@
+LLM Quiz Solver Test Results
+Date: 2025-11-19 16:09:32.445523
+
+Critical Tests: {'local_health': True, 'local_invalid_json': True, 'local_invalid_creds': True, 'prod_health': True, 'prod_demo': True, 'prompt_lengths': True}
+Important Tests: {'prod_invalid_json': True, 'prod_invalid_creds': True, 'repo_files': True}
+Optional Tests: {'local_demo': True}
