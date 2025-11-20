@@ -129,6 +129,8 @@ class QuizSolver:
             logger.info(f"Generated raw answer: {answer}")
 
             logger.info(f"Submitting answer to: {submit_url}")
+            self.current_quiz_url = quiz_url
+
             result = await self.submit_answer(submit_url, answer)
             return result
 
@@ -288,10 +290,11 @@ class QuizSolver:
     async def submit_answer(self, submit_url: str, answer: Any) -> Dict[str, Any]:
         """Submit the answer payload to the quiz endpoint. Accept answer as dict or scalar."""
         payload = {
-            "email": self.email,
-            "secret": self.secret,
-            "answer": answer,
-        }
+    "email": self.email,
+    "secret": self.secret,
+    "url": self.current_quiz_url,
+    "answer": answer,
+}
 
         logger.info(f"Submitting to {submit_url}: {payload}")
 
