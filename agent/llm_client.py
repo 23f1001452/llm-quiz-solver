@@ -95,3 +95,10 @@ class LLMClient:
     def estimate_tokens(self, text: str) -> int:
         """Rough token estimation (4 chars ≈ 1 token)"""
         return len(text) // 4
+    
+    async def generate_answer(self, messages, temperature=0.0):
+        """
+        Compatibility wrapper so QuizSolver can call generate_answer().
+        Internally this just calls the chat() method.
+        """
+        return await self.chat(messages, temperature=temperature)
