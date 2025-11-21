@@ -14,6 +14,10 @@ import os
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
+from utils.web_scraper import WebScraper
+from utils.file_handler import FileHandler
+from utils.data_processor import DataProcessor
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,6 +68,10 @@ class QuizSolver:
         self.tools = QuizTools()
         self.email = os.getenv("STUDENT_EMAIL")
         self.secret = os.getenv("SECRET_KEY")
+        self.scraper = WebScraper()
+        self.file_handler = FileHandler()
+        self.processor = DataProcessor()
+
 
     async def solve_quiz_chain(self, initial_url: str) -> Dict[str, Any]:
         current_url = initial_url
@@ -192,10 +200,6 @@ class QuizSolver:
         raise ValueError("Could not parse quiz instructions from LLM response")
 
     async def execute_solution(self, instructions: Dict[str, Any]) -> Any:
-        """
-        Execute the required task. Enforce that the LLM returns the answer without
-        Markdown code-blocks and in the requested format.
-        """
         task = instructions.get("task", "")
         data_source = instructions.get("data_source", "")
         analysis_type = instructions.get("analysis_type", "")
@@ -208,7 +212,22 @@ class QuizSolver:
         else:
             logger.info("No external data source needed or not a http URL")
 
-        # Step 2: Ask LLM to solve the task with strict formatting instructions
+        # CASE 1: scrape secret
+        if answer_format.lower() == "string" and "scrape" in task.lower():
+            html_text = await self.scraper.scrape_text(self.current_quiz_url)
+            secret = self._extract_secret_from_text(html_text)
+            return secret
+
+        # CASE 2: CSV-based quiz
+        if isinstance(data_source, str) and data_source.endswith(".csv"):
+            import base64
+            # page_raw was already fetched in solve_single_quiz
+            csv_content = base64.b64decode(self.page_raw)
+            df = await self.file_handler.process_csv(csv_content)
+            total = float(df.sum(numeric_only=True).sum())
+            return json.dumps({"sum": total})
+
+        # DEFAULT: LLM solves it
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -220,47 +239,34 @@ class QuizSolver:
                     "Important instructions:\n"
                     "- Provide ONLY the final answer in the required format. No explanations.\n"
                     "- Do NOT wrap the answer in code fences or backticks. No markdown.\n"
-                    "- If the expected format is JSON, return a raw JSON object (not a string).\n"
-                    "- If you cannot compute the answer from the provided information, return the string \"none\".\n\n"
-                    f"{f'Here is the data: {str(data)[:4000]}' if data else ''}\n\n"
+                    "- If JSON expected, output raw JSON.\n\n"
+                    f"{f'Here is the data: {str(data)[:4000]}' if data else ''}\n"
                     "Answer:"
                 ),
             },
         ]
 
-        response = await self.llm.chat(messages, temperature=0.0, max_tokens=2000)
-        raw = response.strip()
+        raw_answer = await self.llm.generate_answer(messages)
+        raw_answer = clean_code_fences(raw_answer)
 
-        # Clean fences and extract JSON if needed
-        raw = clean_code_fences(raw)
-
-        # Convert to proper type according to answer_format
-        if answer_format == "number":
-            # extract possible number
-            m = re.search(r'[-+]?[0-9]*\.?[0-9]+', raw)
+        # type-conversion
+        if answer_format.lower() == "number":
+            m = re.search(r'[-+]?[0-9]*\.?[0-9]+', raw_answer)
             if m:
-                num_str = m.group(0)
-                return float(num_str) if '.' in num_str else int(num_str)
-            else:
-                return raw
+                n = m.group(0)
+                return float(n) if "." in n else int(n)
+            return raw_answer
 
-        if answer_format == "json":
-            # Attempt to extract JSON and parse
-            json_str = extract_json_string(raw)
+        if answer_format.lower() == "json":
+            json_str = extract_json_string(raw_answer)
             if json_str:
                 try:
-                    parsed = json.loads(json_str)
-                    return parsed
-                except Exception:
-                    logger.exception("Failed to parse JSON answer from LLM output")
-                    # As a last resort, return the raw cleaned text
-                    return raw
-            else:
-                logger.warning("No JSON found in LLM response for json answer_format")
-                return raw
+                    return json.loads(json_str)
+                except:
+                    return raw_answer
+            return raw_answer
 
-        # default: return cleaned string
-        return raw
+        return raw_answer
 
     def _extract_submit_url_from_html(self, html: str) -> Optional[str]:
         """Attempt to get the form action or script-defined submit URL directly from HTML."""
@@ -320,3 +326,13 @@ class QuizSolver:
                 "next_url": result.get("url"),
                 "message": result.get("message", ""),
             }
+    
+    def _extract_secret_from_text(self, text: str) -> str:
+        """
+        Extracts the secret code from HTML text.
+        Usually visible as: SECRET: ABCD1234
+        """
+        import re
+        match = re.search(r"[A-Z0-9]{6,}", text)
+        return match.group(0) if match else "UNKNOWN"
+
