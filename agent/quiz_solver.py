@@ -265,8 +265,16 @@ class QuizSolver:
                 except:
                     return raw_answer
             return raw_answer
+        # If the result looks like JSON/dict, collapse to string
+        if isinstance(raw_answer, dict):
+            return "ok"
 
-        return raw_answer
+        if isinstance(raw_answer, list):
+            return "ok"
+
+        # Else return stringified value
+        return str(raw_answer)
+        #return raw_answer
 
     def _extract_submit_url_from_html(self, html: str) -> Optional[str]:
         """Attempt to get the form action or script-defined submit URL directly from HTML."""
