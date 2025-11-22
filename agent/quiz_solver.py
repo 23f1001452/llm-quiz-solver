@@ -121,11 +121,16 @@ HTML Content:
 
 Return ONLY a valid JSON object (no explanation, no markdown, no extra text) with these keys:
 - task: description of what to do
-- data_source: URL or description of data to fetch (or "none" if not needed)
+- data_source: URL or filename to fetch (or "none" if not needed)
 - analysis_type: what kind of analysis (sum, filter, visualization, etc.)
 - answer_format: expected format (number, string, json, base64, etc.)
-- submit_url: where to POST the answer
+- submit_url: ONLY the path like "/submit" or full URL - do NOT include phrases like "current origin"
 - payload_template: the JSON structure for submission
+
+CRITICAL: For submit_url, extract ONLY the actual URL path. Examples:
+- If you see "Post to /submit" → return "/submit"
+- If you see "https://example.com/submit" → return "https://example.com/submit"
+- DO NOT return things like "current origin + /submit" - just return "/submit"
 
 Response must be pure JSON only, starting with {{ and ending with }}.
 """}
@@ -154,6 +159,18 @@ Response must be pure JSON only, starting with {{ and ending with }}.
             
             json_str = response[json_start:json_end]
             parsed = json.loads(json_str)
+            
+            # Clean up submit_url if it contains garbage
+            submit_url = parsed.get("submit_url", "")
+            if submit_url and not submit_url.startswith('/') and not submit_url.startswith('http'):
+                # Extract just the path if LLM added extra text
+                if '/submit' in submit_url:
+                    parsed["submit_url"] = "/submit"
+                elif '/' in submit_url:
+                    # Try to extract the path
+                    parts = submit_url.split('/')
+                    if len(parts) > 1:
+                        parsed["submit_url"] = '/' + parts[-1]
             
             logger.info(f"Successfully parsed quiz instructions")
             return parsed
