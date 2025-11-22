@@ -103,6 +103,9 @@ class QuizSolver:
         try:
             logger.info(f"Fetching quiz from: {quiz_url}")
             quiz_content = await self.tools.fetch_page(quiz_url)
+
+            self.current_quiz_url = quiz_url
+
             logger.info(f"Fetched {len(quiz_content)} characters from quiz page")
 
             # Prefer deterministic extraction from HTML
@@ -137,7 +140,6 @@ class QuizSolver:
             logger.info(f"Generated raw answer: {answer}")
 
             logger.info(f"Submitting answer to: {submit_url}")
-            self.current_quiz_url = quiz_url
 
             result = await self.submit_answer(submit_url, answer)
             return result
@@ -285,25 +287,6 @@ class QuizSolver:
 
         return raw_answer
 
-
-        '''if answer_format.lower() == "json":
-            json_str = extract_json_string(raw_answer)
-            if json_str:
-                try:
-                    return json.loads(json_str)
-                except:
-                    return raw_answer
-            return raw_answer
-        # If the result looks like JSON/dict, collapse to string
-        if isinstance(raw_answer, dict):
-            return "ok"
-
-        if isinstance(raw_answer, list):
-            return "ok"
-
-        # Else return stringified value
-        return str(raw_answer)
-        #return raw_answer '''
 
     def _extract_submit_url_from_html(self, html: str) -> Optional[str]:
         """Attempt to get the form action or script-defined submit URL directly from HTML."""
