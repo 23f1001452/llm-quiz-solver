@@ -99,7 +99,7 @@ class QuizSolver:
                 raise ValueError("No submit_url found in instructions")
             
             logger.info(f"Submitting answer to: {submit_url}")
-            result = await self.submit_answer(submit_url, answer)
+            result = await self.submit_answer(submit_url, answer, quiz_url)
             
             return result
             
@@ -293,11 +293,21 @@ Answer:
     async def submit_answer(
         self,
         submit_url: str,
-        answer: Any
+        answer: Any,
+        quiz_url: str = None
     ) -> Dict[str, Any]:
         """
         Submit answer to the quiz endpoint
         """
+        # Convert relative URL to absolute URL
+        if not submit_url.startswith('http'):
+            if quiz_url:
+                from urllib.parse import urljoin
+                submit_url = urljoin(quiz_url, submit_url)
+                logger.info(f"Converted relative URL to: {submit_url}")
+            else:
+                raise ValueError(f"Cannot resolve relative submit URL: {submit_url}")
+        
         payload = {
             "email": self.email,
             "secret": self.secret,
@@ -316,5 +326,6 @@ Answer:
             return {
                 "correct": result.get("correct", False),
                 "next_url": result.get("url"),
-                "message": result.get("message", "")
+                "message": result.get("message", ""),
+                "reason": result.get("reason", "")
             }
