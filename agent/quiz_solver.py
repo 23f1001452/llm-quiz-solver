@@ -209,7 +209,8 @@ Response must be pure JSON only, starting with {{ and ending with }}.
                 soup = BeautifulSoup(page_content, 'html.parser')
                 page_text = soup.get_text(separator='\n', strip=True)
                 data = page_text
-                logger.info(f"Extracted page text: {page_text[:500]}...")
+                page_preview = page_text[:500]
+                logger.info(f"Extracted page text: {page_preview}...")
         
         # Fetch external data source if specified
         if data_source and data_source != "none" and data_source.lower() != "none":
@@ -225,15 +226,22 @@ Response must be pure JSON only, starting with {{ and ending with }}.
                         logger.info(f"Fetching data from: {full_url}")
                         data = await self.tools.fetch_data(full_url)
         
+        # Prepare data context for LLM
+        data_context = ""
+        if data:
+            data_str = str(data)
+            data_preview = data_str[:4000]
+            data_context = f"Page Content:\n{data_preview}"
+        else:
+            data_context = "No additional data provided"
+        
         # Step 2: Use LLM to solve the task
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"""
+        prompt_text = f"""
 Task: {task}
 Analysis Type: {analysis_type}
 Expected Answer Format: {answer_format}
 
-{f"Page Content:\n{str(data)[:4000]}" if data else "No additional data provided"}
+{data_context}
 
 Solve this task and provide ONLY the final answer in the required format.
 Do not include explanations, just the answer value.
@@ -247,12 +255,17 @@ If the answer should be:
 IMPORTANT: Look carefully at the page content above and extract the required information.
 
 Answer:
-"""}
+"""
+        
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt_text}
         ]
         
         response = await self.llm.chat(messages, temperature=0.0, max_tokens=2000)
         
-        logger.info(f"Generated raw answer: {response[:200]}")
+        response_preview = response[:200]
+        logger.info(f"Generated raw answer: {response_preview}")
         
         # Clean up response
         answer = response.strip()
