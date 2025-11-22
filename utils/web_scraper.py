@@ -15,21 +15,48 @@ class WebScraper:
     Web scraping utilities
     """
     
+    import re
+from bs4 import BeautifulSoup
+import base64
+
+class WebScraper:
     async def scrape_text(self, url: str) -> str:
         """
-        Scrape text content from URL
+        Fetches the page, decodes base64 if needed,
+        and extracts the secret code using robust regex.
         """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Remove script and style
-            for element in soup(['script', 'style', 'nav', 'footer']):
-                element.decompose()
-            
-            return soup.get_text(separator='\n', strip=True)
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url)
+        content = resp.content
+
+        # Detect and decode base64
+        try:
+            if b"<" not in content:
+                # probably base64
+                decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                html = decoded
+            else:
+                html = content.decode("utf-8", errors="ignore")
+        except Exception:
+            html = content.decode("utf-8", errors="ignore")
+
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+
+        # Robust secret extraction:
+        # Look for any uppercase alphanumeric code 5–20 chars
+        match = re.search(r"\b[A-Z0-9]{5,20}\b", text)
+        if match:
+            return match.group(0)
+
+        # If page uses "Secret:" pattern
+        match = re.search(r"[Ss]ecret[^A-Za-z0-9]*([A-Za-z0-9]{4,30})", text)
+        if match:
+            return match.group(1)
+
+        return "UNKNOWN"
     
     async def scrape_table(self, url: str) -> List[Dict]:
         """
