@@ -1,105 +1,81 @@
-# ========================================================================
-# utils/web_scraper.py - FIXED Web Scraping Utilities
-# ========================================================================
-
 import httpx
-import base64
-import logging
 import re
-from typing import Dict, List, Optional
+import base64
 from bs4 import BeautifulSoup
-
-logger = logging.getLogger(__name__)
 
 
 class WebScraper:
     """
-    Web scraping utilities used by QuizSolver
+    Robust scraper used in the quiz solver:
+    - Handles raw HTML and base64-encoded HTML.
+    - Extracts visible text.
+    - Detects quiz secret strings with several fallback patterns.
     """
 
-    async def scrape_text(self, url: str) -> str:
-        """
-        Fetch page HTML (base64 or normal), extract visible text,
-        then detect secret codes with robust regex.
-        """
+    async def fetch(self, url: str) -> str:
+        """Fetch raw bytes from a URL."""
         async with httpx.AsyncClient() as client:
             resp = await client.get(url)
+        return resp.content
 
-        content = resp.content
-
-        # ----- Base64 decode if needed -----
+    def _decode_content(self, raw: bytes) -> str:
+        """
+        Decode page content.
+        If < is not present, it is likely base64-encoded HTML.
+        """
         try:
-            if b"<" not in content:
-                # Probably base64
-                decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
-                html = decoded
-            else:
-                html = content.decode("utf-8", errors="ignore")
+            if b"<" not in raw:
+                decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
+                return decoded
+            return raw.decode("utf-8", errors="ignore")
         except Exception:
-            html = content.decode("utf-8", errors="ignore")
+            return raw.decode("utf-8", errors="ignore")
 
+    def _extract_visible_text(self, html: str) -> str:
+        """Extract clean visible text using BeautifulSoup."""
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator=" ", strip=True)
+        return soup.get_text(separator=" ", strip=True)
 
-        # ----- Detect secret codes -----
-        # Accept uppercase, lowercase, and digits  (QUIZ SECRETS OFTEN LOOK LIKE "f2Ab9")
-        match = re.search(r"\b[A-Za-z0-9]{4,30}\b", text)
+    def _extract_secret(self, text: str) -> str:
+        """
+        Extract secret codes (uppercase/lowercase alphanumeric).
+        Quiz secrets usually appear as 6–20 char tokens.
+        """
+
+        # 1) Direct alphanumeric code
+        match = re.search(r"\b[A-Za-z0-9]{5,30}\b", text)
         if match:
             return match.group(0)
 
-        # Look for "Secret: CODE"
-        match = re.search(r"[Ss]ecret[^A-Za-z0-9]*([A-Za-z0-9]{4,30})", text)
+        # 2) Patterns like "SECRET: s3crEt9"
+        match = re.search(
+            r"[Ss]ecret[^A-Za-z0-9]*([A-Za-z0-9]{4,30})",
+            text,
+        )
+        if match:
+            return match.group(1)
+
+        # 3) Patterns like "The code is xyz123"
+        match = re.search(
+            r"[Cc]ode[^A-Za-z0-9]*([A-Za-z0-9]{4,30})",
+            text,
+        )
         if match:
             return match.group(1)
 
         return "UNKNOWN"
 
-    async def scrape_table(self, url: str) -> List[Dict]:
+    async def scrape_text(self, url: str) -> str:
         """
-        Scrape tables from HTML
+        High-level method:
+        - Fetch URL
+        - Decode (HTML or base64)
+        - Extract text
+        - Extract secret token
         """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+        raw = await self.fetch(url)
+        html = self._decode_content(raw)
+        text = self._extract_visible_text(html)
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        tables = soup.find_all("table")
-
-        result = []
-        for table in tables:
-            rows = []
-            headers = [th.get_text(strip=True) for th in table.find_all("th")]
-
-            for tr in table.find_all("tr")[1:]:
-                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if cells:
-                    if headers:
-                        rows.append(dict(zip(headers, cells)))
-                    else:
-                        rows.append(cells)
-
-            result.append(rows)
-
-        return result
-
-    async def fetch_api(
-        self,
-        url: str,
-        method: str = "GET",
-        headers: Optional[Dict] = None,
-        params: Optional[Dict] = None,
-        json: Optional[Dict] = None,
-    ) -> Dict:
-        """
-        Standardized API request wrapper
-        """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            if method.upper() == "GET":
-                resp = await client.get(url, headers=headers, params=params)
-            elif method.upper() == "POST":
-                resp = await client.post(url, headers=headers, json=json)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-
-            resp.raise_for_status()
-            return resp.json()
+        secret = self._extract_secret(text)
+        return secret
