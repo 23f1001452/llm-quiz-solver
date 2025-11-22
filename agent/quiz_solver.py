@@ -1,355 +1,340 @@
 # ============================================================================
-# agent/quiz_solver.py - Main Quiz Solving Logic
+# Fixed agent/quiz_solver.py - Hardened Quiz Solving Logic
 # ============================================================================
 
 import json
 import logging
+import re
 from typing import Dict, Any, Optional
 from agent.llm_client import LLMClient
 from agent.tools import QuizTools
 from agent.prompts import SYSTEM_PROMPT, TASK_PLANNING_PROMPT
 import httpx
 import os
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+
+from utils.web_scraper import WebScraper
+from utils.file_handler import FileHandler
+from utils.data_processor import DataProcessor
 
 logger = logging.getLogger(__name__)
 
 
+def clean_code_fences(text: str) -> str:
+    """Remove Markdown fenced code blocks and leading language tags."""
+    if not text:
+        return text
+    # Remove ```lang ... ``` or ``` ... ```
+    # If multiple code fences exist, prefer the largest JSON-like block
+    fences = re.findall(r'```[\s\S]*?```', text)
+    if fences:
+        # choose fence with largest number of braces inside (likely the JSON)
+        best = max(fences, key=lambda f: f.count('{'))
+        inner = re.sub(r'^```\w*\n?', '', best)
+        inner = re.sub(r'\n?```$', '', inner)
+        return inner.strip()
+
+    # Also strip inline backticks if present
+    text = text.replace('`', '')
+    return text.strip()
+
+
+def extract_json_string(text: str) -> Optional[str]:
+    """Attempt to find the most plausible JSON object inside text."""
+    if not text:
+        return None
+    # First try to find a top-level JSON object
+    m = re.search(r'(\{[\s\S]*\})', text)
+    if m:
+        return m.group(1).strip()
+
+    # Fall back to a looser pattern (arrays included)
+    m = re.search(r'(\[[\s\S]*\])', text)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
 class QuizSolver:
     """
-    Main quiz solver that orchestrates the entire process
+    Hardened quiz solver that uses both HTML extraction and LLM parsing,
+    validates LLM outputs, and sanitizes answers before submit.
     """
-    
+
     def __init__(self):
         self.llm = LLMClient()
         self.tools = QuizTools()
         self.email = os.getenv("STUDENT_EMAIL")
         self.secret = os.getenv("SECRET_KEY")
-    
+        self.scraper = WebScraper()
+        self.file_handler = FileHandler()
+        self.processor = DataProcessor()
+
+
     async def solve_quiz_chain(self, initial_url: str) -> Dict[str, Any]:
-        """
-        Solve a chain of quizzes starting from initial_url
-        
-        Returns:
-            dict: Summary of results
-        """
         current_url = initial_url
         quizzes_solved = 0
-        max_quizzes = 10  # Safety limit
-        
+        max_quizzes = 10  # safety
+
         while current_url and quizzes_solved < max_quizzes:
             logger.info(f"Solving quiz {quizzes_solved + 1}: {current_url}")
-            
             try:
-                # Solve single quiz
                 result = await self.solve_single_quiz(current_url)
                 quizzes_solved += 1
-                
-                # Check if there's another quiz
                 current_url = result.get("next_url")
-                
                 if not current_url:
                     logger.info("No more quizzes in chain")
                     break
-                    
             except Exception as e:
                 logger.error(f"Error solving quiz: {str(e)}", exc_info=True)
                 return {
                     "message": f"Failed at quiz {quizzes_solved + 1}: {str(e)}",
-                    "quizzes_solved": quizzes_solved
+                    "quizzes_solved": quizzes_solved,
                 }
-        
+
         return {
             "message": f"Successfully completed {quizzes_solved} quiz(es)",
-            "quizzes_solved": quizzes_solved
+            "quizzes_solved": quizzes_solved,
         }
-    
+
     async def solve_single_quiz(self, quiz_url: str) -> Dict[str, Any]:
-        """
-        Solve a single quiz
-        
-        Steps:
-        1. Fetch and render the quiz page
-        2. Extract quiz instructions
-        3. Plan solution approach
-        4. Execute solution
-        5. Submit answer
-        6. Return result with potential next URL
-        """
         try:
             logger.info(f"Fetching quiz from: {quiz_url}")
-            
-            # Step 1: Fetch quiz page
             quiz_content = await self.tools.fetch_page(quiz_url)
             logger.info(f"Fetched {len(quiz_content)} characters from quiz page")
-            
-            # Step 2: Parse quiz instructions
+
+            # Prefer deterministic extraction from HTML
+            submit_url_from_html = self._extract_submit_url_from_html(quiz_content)
+
             logger.info("Parsing quiz instructions via LLM...")
             instructions = await self.parse_quiz(quiz_content)
-            instructions["quiz_url"] = quiz_url  # Add quiz URL for context
             logger.info(f"Parsed instructions: {instructions}")
-            
-            # Step 3: Plan and execute solution
+
+            # If HTML provided a submit action, prefer it
+            submit_url = None
+            if submit_url_from_html:
+                submit_url = submit_url_from_html
+                logger.info(f"Found submit URL in HTML: {submit_url}")
+
+            # Otherwise, take from LLM instructions (but validate)
+            if not submit_url:
+                submit_url = instructions.get("submit_url")
+
+            if not submit_url or str(submit_url).lower() == "none":
+                raise ValueError(f"No submit_url found in HTML or LLM output: {submit_url}")
+
+            # Validate submit_url doesn't contain nonsense like 'origin + /submit'
+            if any(token in str(submit_url).lower() for token in ["origin", "+", "current"]):
+                raise ValueError(f"Invalid submit_url returned by LLM: {submit_url}")
+
+            # Convert relative to absolute
+            submit_url = urljoin(quiz_url, submit_url)
+
             logger.info("Executing solution...")
             answer = await self.execute_solution(instructions)
-            logger.info(f"Generated answer: {answer}")
-            
-            # Step 4: Submit answer
-            submit_url = instructions.get("submit_url")
-            if not submit_url:
-                raise ValueError("No submit_url found in instructions")
-            
+            logger.info(f"Generated raw answer: {answer}")
+
             logger.info(f"Submitting answer to: {submit_url}")
-            result = await self.submit_answer(submit_url, answer, quiz_url)
-            
+            self.current_quiz_url = quiz_url
+
+            result = await self.submit_answer(submit_url, answer)
             return result
-            
+
         except Exception as e:
             logger.error(f"Error in solve_single_quiz: {str(e)}", exc_info=True)
             raise
-    
+
     async def parse_quiz(self, html_content: str) -> Dict[str, Any]:
         """
-        Use LLM to parse quiz instructions from HTML
+        Use an LLM to parse the quiz page but with strict instructions to not
+        invent URLs or make guesses. If possible, the caller should prefer
+        HTML-extracted submit URL over the LLM value.
         """
+        # Shorten HTML content so we don't exceed context too much
+        sample = html_content[:12000]
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"""
-Parse this quiz page and extract the information.
-
-HTML Content:
-{html_content[:8000]}
-
-Return ONLY a valid JSON object (no explanation, no markdown, no extra text) with these keys:
-- task: description of what to do
-- data_source: URL or filename to fetch (or "none" if not needed)
-- analysis_type: what kind of analysis (sum, filter, visualization, etc.)
-- answer_format: expected format (number, string, json, base64, etc.)
-- submit_url: ONLY the path like "/submit" or full URL - do NOT include phrases like "current origin"
-- payload_template: the JSON structure for submission
-
-CRITICAL: For submit_url, extract ONLY the actual URL path. Examples:
-- If you see "Post to /submit" → return "/submit"
-- If you see "https://example.com/submit" → return "https://example.com/submit"
-- DO NOT return things like "current origin + /submit" - just return "/submit"
-
-Response must be pure JSON only, starting with {{ and ending with }}.
-"""}
+            {
+                "role": "user",
+                "content": (
+                    "Parse this quiz page and extract the information.\n\n"
+                    "Return ONLY a valid JSON object (no explanation, no markdown) with these keys:\n"
+                    "- task: description of what to do\n"
+                    "- data_source: URL or description of data to fetch (or \"none\")\n"
+                    "- analysis_type: what kind of analysis\n"
+                    "- answer_format: expected format (number, string, json, base64, etc.)\n"
+                    "- submit_url: EXACT submit endpoint as found in the HTML (e.g. /submit or https://site/submit).\n"
+                    "   IMPORTANT: DO NOT GUESS. If the submit URL is not present in the HTML, return \"none\".\n"
+                    "- payload_template: sample JSON structure for submission (if available)\n\n"
+                    "HTML Content:\n"
+                    f"{sample}\n\n"
+                    "Response must be pure JSON only, starting with { and ending with }."
+                ),
+            },
         ]
-        
+
         response = await self.llm.chat(messages, temperature=0.0)
-        
+        response = response.strip()
+
+        # remove code fences if the model wrapped the JSON in them
+        response = clean_code_fences(response)
+
         try:
-            # Try to extract JSON from response
-            # Handle markdown code blocks
-            response = response.strip()
-            
-            # Remove markdown code block markers
-            if response.startswith('```'):
-                # Remove ```json or ``` at start
-                response = response.split('\n', 1)[1] if '\n' in response else response[3:]
-            if response.endswith('```'):
-                response = response.rsplit('\n', 1)[0] if '\n' in response else response[:-3]
-            
-            # Find JSON object boundaries
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            
-            if json_start == -1 or json_end == 0:
-                raise ValueError("No JSON object found in response")
-            
-            json_str = response[json_start:json_end]
-            parsed = json.loads(json_str)
-            
-            # Clean up submit_url if it contains garbage
-            submit_url = parsed.get("submit_url", "")
-            if submit_url and not submit_url.startswith('/') and not submit_url.startswith('http'):
-                # Extract just the path if LLM added extra text
-                if '/submit' in submit_url:
-                    parsed["submit_url"] = "/submit"
-                elif '/' in submit_url:
-                    # Try to extract the path
-                    parts = submit_url.split('/')
-                    if len(parts) > 1:
-                        parsed["submit_url"] = '/' + parts[-1]
-            
-            logger.info(f"Successfully parsed quiz instructions")
+            parsed = json.loads(response)
+            logger.info("Successfully parsed JSON from LLM response")
             return parsed
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {str(e)}")
-            logger.error(f"Attempted to parse: {json_str[:500]}")
-            
-            # Try to extract JSON more aggressively
-            try:
-                # Look for the last complete JSON object
-                import re
-                json_objects = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response, re.DOTALL)
-                if json_objects:
-                    # Try each found JSON object
-                    for json_obj in reversed(json_objects):
-                        try:
-                            parsed = json.loads(json_obj)
-                            if 'task' in parsed and 'submit_url' in parsed:
-                                logger.info("Extracted JSON using regex fallback")
-                                return parsed
-                        except:
-                            continue
-            except Exception as e2:
-                logger.error(f"Regex extraction failed: {str(e2)}")
-            
-            raise ValueError("Could not parse quiz instructions")
-        except Exception as e:
-            logger.error(f"Failed to parse LLM response: {response[:500]}")
-            raise
-    
+        except json.JSONDecodeError:
+            # Try to extract JSON object from noisy text
+            json_str = extract_json_string(response)
+            if json_str:
+                try:
+                    parsed = json.loads(json_str)
+                    logger.info("Extracted JSON using fallback regex")
+                    return parsed
+                except Exception:
+                    logger.exception("Fallback JSON extraction failed")
+
+        raise ValueError("Could not parse quiz instructions from LLM response")
+
     async def execute_solution(self, instructions: Dict[str, Any]) -> Any:
         """
-        Execute the solution based on parsed instructions
+        Execute the required task. Enforce that the LLM returns the answer without
+        Markdown code-blocks and in the requested format.
         """
         task = instructions.get("task", "")
         data_source = instructions.get("data_source", "")
         analysis_type = instructions.get("analysis_type", "")
         answer_format = instructions.get("answer_format", "string")
-        quiz_url = instructions.get("quiz_url", "")  # Get the quiz URL for context
-        
+
         # Step 1: Fetch data if needed
         data = None
-        page_content = None
-        
-        # If task involves scraping the current page, fetch it
-        if "scrape" in task.lower() or "scrape" in analysis_type.lower():
-            logger.info(f"Task involves scraping, using WebScraper")
-            if quiz_url:
-                # Use the custom WebScraper
-                from utils.web_scraper import WebScraper
-                scraper = WebScraper()
-                secret = await scraper.scrape_text(quiz_url)
-                logger.info(f"Scraped secret: {secret}")
-                data = secret
-                # Also get full page text as backup
-                page_content = await self.tools.fetch_page(quiz_url)
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(page_content, 'html.parser')
-                page_text = soup.get_text(separator='\n', strip=True)
-                data = f"Secret Code: {secret}\n\nFull Page Text:\n{page_text}"
-                page_preview = data[:500]
-                logger.info(f"Extracted data: {page_preview}...")
-        
-        # Fetch external data source if specified
-        if data_source and data_source != "none" and data_source.lower() != "none":
-            if data_source.startswith("http"):
-                # Download file or fetch API
-                data = await self.tools.fetch_data(data_source)
-            elif data_source.endswith('.csv') or data_source.endswith('.pdf'):
-                # Construct full URL if relative path
-                if not data_source.startswith('http'):
-                    from urllib.parse import urljoin
-                    if quiz_url:
-                        full_url = urljoin(quiz_url, data_source)
-                        logger.info(f"Fetching data from: {full_url}")
-                        data = await self.tools.fetch_data(full_url)
-        
-        # Prepare data context for LLM
-        data_context = ""
-        if data:
-            data_str = str(data)
-            data_preview = data_str[:4000]
-            data_context = f"Page Content:\n{data_preview}"
+        if data_source and isinstance(data_source, str) and data_source.startswith("http"):
+            data = await self.tools.fetch_data(data_source)
         else:
-            data_context = "No additional data provided"
-        
-        # Step 2: Use LLM to solve the task
-        prompt_text = f"""
-Task: {task}
-Analysis Type: {analysis_type}
-Expected Answer Format: {answer_format}
+            logger.info("No external data source needed or not a http URL")
 
-{data_context}
-
-Solve this task and provide ONLY the final answer in the required format.
-Do not include explanations, just the answer value.
-
-If the answer should be:
-- A number: return just the number
-- A string: return just the string (no quotes unless part of the answer)
-- JSON: return valid JSON
-- base64: return the base64 string
-
-IMPORTANT: Look carefully at the page content above and extract the required information.
-
-Answer:
-"""
-        
+        # Step 2: Ask LLM to solve the task with strict formatting instructions
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_text}
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task}\n"
+                    f"Analysis Type: {analysis_type}\n"
+                    f"Expected Answer Format: {answer_format}\n\n"
+                    "Important instructions:\n"
+                    "- Provide ONLY the final answer in the required format. No explanations.\n"
+                    "- Do NOT wrap the answer in code fences or backticks. No markdown.\n"
+                    "- If the expected format is JSON, return a raw JSON object (not a string).\n"
+                    "- If you cannot compute the answer from the provided information, return the string \"none\".\n\n"
+                    f"{f'Here is the data: {str(data)[:4000]}' if data else ''}\n\n"
+                    "Answer:"
+                ),
+            },
         ]
-        
-        response = await self.llm.chat(messages, temperature=0.0, max_tokens=2000)
-        
-        response_preview = response[:200]
-        logger.info(f"Generated raw answer: {response_preview}")
-        
-        # Clean up response
-        answer = response.strip()
-        
-        # Convert to appropriate type
-        if answer_format == "number":
-            try:
-                answer = float(answer) if "." in answer else int(answer)
-            except:
-                pass
-        elif answer_format == "json":
-            try:
-                # Try to extract JSON if wrapped in markdown
-                if "```" in answer:
-                    answer = answer.split("```")[1]
-                    if answer.startswith("json"):
-                        answer = answer[4:]
-                answer = json.loads(answer.strip())
-            except Exception as e:
-                logger.error(f"Failed to parse JSON answer: {e}")
-                pass
-        
-        return answer
-    
-    async def submit_answer(
-        self,
-        submit_url: str,
-        answer: Any,
-        quiz_url: str = None
-    ) -> Dict[str, Any]:
-        """
-        Submit answer to the quiz endpoint
-        """
-        # Convert relative URL to absolute URL
-        if not submit_url.startswith('http'):
-            if quiz_url:
-                from urllib.parse import urljoin
-                submit_url = urljoin(quiz_url, submit_url)
-                logger.info(f"Converted relative URL to: {submit_url}")
+
+        # CASE 1: answer_format = string AND task = scrape secret
+        if instructions["answer_format"].lower() == "string" and "scrape" in instructions["task"].lower():
+            html_text = await self.scraper.scrape_text(self.current_quiz_url)
+            secret = self._extract_secret_from_text(html_text)
+            return secret
+
+        # DEFAULT: LLM fallback
+        raw_answer = await self.llm.chat(messages, temperature=0.0)
+
+        raw_answer = clean_code_fences(raw_answer)
+
+        # Convert to proper type according to answer_format
+        if answer_format.lower() == "number":
+            m = re.search(r'[-+]?[0-9]*\.?[0-9]+', raw_answer)
+            if m:
+                num_str = m.group(0)
+                return float(num_str) if '.' in num_str else int(num_str)
             else:
-                raise ValueError(f"Cannot resolve relative submit URL: {submit_url}")
-        
+                return raw_answer
+
+        if answer_format.lower() == "json":
+            # Attempt to extract JSON and parse
+            json_str = extract_json_string(raw_answer)
+            if json_str:
+                try:
+                    parsed = json.loads(json_str)
+                    return parsed
+                except Exception:
+                    logger.exception("Failed to parse JSON answer from LLM output")
+                    return raw_answer
+            else:
+                logger.warning("No JSON found in LLM response for json answer_format")
+                return raw_answer
+
+        return raw_answer
+
+    def _extract_submit_url_from_html(self, html: str) -> Optional[str]:
+        """Attempt to get the form action or script-defined submit URL directly from HTML."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            # Look for <form action>
+            form = soup.find("form", action=True)
+            if form and form.get("action"):
+                return form.get("action").strip()
+
+            # Look for fetch(".../submit")
+            scripts = "\n".join(s.get_text() for s in soup.find_all("script"))
+            m = re.search(r"fetch\(\s*['\"]([^'\"]+/submit)['\"]", scripts)
+            if m:
+                return m.group(1)
+
+            # meta tag fallback
+            meta = soup.find("meta", attrs={"name": "submit-url"})
+            if meta and meta.get("content"):
+                return meta.get("content").strip()
+
+        except Exception:
+            logger.exception("Failed to extract submit URL from HTML")
+
+        return None
+
+    async def submit_answer(self, submit_url: str, answer: Any) -> Dict[str, Any]:
+        """Submit the answer payload to the quiz endpoint. Accept answer as dict or scalar."""
         payload = {
             "email": self.email,
             "secret": self.secret,
-            "url": quiz_url,  # Add the quiz URL to payload
-            "answer": answer
+            "url": self.current_quiz_url,
+            "answer": answer,
         }
-        
+
         logger.info(f"Submitting to {submit_url}: {payload}")
-        
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(submit_url, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                body = None
+                try:
+                    body = response.json()
+                except Exception:
+                    body = response.text
+                logger.error(f"Submission failed {response.status_code}: {body}")
+                raise
+
             result = response.json()
-            
             logger.info(f"Submission result: {result}")
-            
+
             return {
                 "correct": result.get("correct", False),
                 "next_url": result.get("url"),
                 "message": result.get("message", ""),
-                "reason": result.get("reason", "")
             }
+    
+    def _extract_secret_from_text(self, text: str) -> str:
+        """
+        Extracts the secret code from HTML text.
+        Usually visible as: SECRET: ABCD1234
+        """
+        match = re.search(r"[A-Z0-9]{6,}", text)
+        return match.group(0) if match else "UNKNOWN"
+
