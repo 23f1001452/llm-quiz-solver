@@ -218,16 +218,22 @@ Response must be pure JSON only, starting with {{ and ending with }}.
         
         # If task involves scraping the current page, fetch it
         if "scrape" in task.lower() or "scrape" in analysis_type.lower():
-            logger.info(f"Task involves scraping, fetching page content from quiz URL")
+            logger.info(f"Task involves scraping, using WebScraper")
             if quiz_url:
+                # Use the custom WebScraper
+                from utils.web_scraper import WebScraper
+                scraper = WebScraper()
+                secret = await scraper.scrape_text(quiz_url)
+                logger.info(f"Scraped secret: {secret}")
+                data = secret
+                # Also get full page text as backup
                 page_content = await self.tools.fetch_page(quiz_url)
-                # Parse HTML to extract text
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(page_content, 'html.parser')
                 page_text = soup.get_text(separator='\n', strip=True)
-                data = page_text
-                page_preview = page_text[:500]
-                logger.info(f"Extracted page text: {page_preview}...")
+                data = f"Secret Code: {secret}\n\nFull Page Text:\n{page_text}"
+                page_preview = data[:500]
+                logger.info(f"Extracted data: {page_preview}...")
         
         # Fetch external data source if specified
         if data_source and data_source != "none" and data_source.lower() != "none":
@@ -328,6 +334,7 @@ Answer:
         payload = {
             "email": self.email,
             "secret": self.secret,
+            "url": quiz_url,  # Add the quiz URL to payload
             "answer": answer
         }
         
