@@ -1,4 +1,4 @@
-# ============================================================================
+'''# ============================================================================
 # Fixed agent/quiz_solver.py - Hardened Quiz Solving Logic
 # ============================================================================
 
@@ -337,4 +337,113 @@ class QuizSolver:
         """
         match = re.search(r"[A-Z0-9]{6,}", text)
         return match.group(0) if match else "UNKNOWN"
+'''
+
+import httpx
+import re
+import time
+from urllib.parse import urljoin
+
+BASE = "https://tds-llm-analysis.s-anand.net"
+
+EMAIL = "YOUR_EMAIL_HERE"
+SECRET = "YOUR_SECRET_HERE"
+
+client = httpx.Client(timeout=10)
+
+
+def fetch_page(url: str) -> str:
+    """GET the quiz step page."""
+    full = urljoin(BASE, url)
+    print(f"\n[GET] {full}")
+    r = client.get(full)
+    r.raise_for_status()
+    return r.text
+
+
+def extract_answer(html: str) -> str:
+    """
+    Extract the answer from the page.
+    Supports formats:
+    - <code>ANSWER</code>
+    - Answer: XYZ
+    - JSON hidden patterns
+    """
+    # Try <code>ANSWER</code>
+    m = re.search(r"<code>(.*?)</code>", html, re.S)
+    if m:
+        ans = m.group(1).strip()
+        if ans:
+            return ans
+
+    # Try “Answer: …”
+    m = re.search(r"Answer[: ]+</?[^>]*>(.*?)<", html, re.I)
+    if m:
+        ans = m.group(1).strip()
+        if ans:
+            return ans
+
+    # Try plain text "Answer = XYZ"
+    m = re.search(r"answer\s*=\s*([^\s<]+)", html, re.I)
+    if m:
+        return m.group(1).strip()
+
+    raise ValueError("Answer not found in page")
+
+
+def submit(url: str, answer: str) -> dict:
+    """Always POST JSON to /submit — NEVER GET."""
+    payload = {
+        "email": EMAIL,
+        "secret": SECRET,
+        "url": url,
+        "answer": answer
+    }
+
+    print(f"[POST] /submit  answer={answer}")
+    r = client.post(f"{BASE}/submit", json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def solve_step(url: str) -> str | None:
+    """Fetch page → Extract answer → Submit → Return next URL."""
+    html = fetch_page(url)
+    answer = extract_answer(html)
+
+    resp = submit(url, answer)
+    print("Response:", resp)
+
+    if resp.get("correct") and resp.get("next"):
+        return resp["next"]
+    return None
+
+
+def main():
+    url = "/project2"
+
+    seen = set()
+    step = 1
+
+    while url and url not in seen:
+        print(f"\n========== Step {step}: {url} ==========")
+        seen.add(url)
+
+        try:
+            next_url = solve_step(url)
+        except Exception as e:
+            print("❌ Error:", e)
+            break
+
+        if not next_url:
+            print("\n🎉 No next URL returned — final step reached!")
+            break
+
+        url = next_url
+        step += 1
+        time.sleep(0.4)
+
+
+if __name__ == "__main__":
+    main()
 
