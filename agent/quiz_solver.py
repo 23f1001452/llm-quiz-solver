@@ -1,449 +1,115 @@
-'''# ============================================================================
-# Fixed agent/quiz_solver.py - Hardened Quiz Solving Logic
+# ============================================================================
+# quiz_solver.py - Async Quiz Solver used by FastAPI
 # ============================================================================
 
-import json
-import logging
 import re
-from typing import Dict, Any, Optional
-from agent.llm_client import LLMClient
-from agent.tools import QuizTools
-from agent.prompts import SYSTEM_PROMPT, TASK_PLANNING_PROMPT
 import httpx
-import os
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-
-from utils.web_scraper import WebScraper
-from utils.file_handler import FileHandler
-from utils.data_processor import DataProcessor
-
-logger = logging.getLogger(__name__)
-
-
-def clean_code_fences(text: str) -> str:
-    """Remove Markdown fenced code blocks and leading language tags."""
-    if not text:
-        return text
-    # Remove ```lang ... ``` or ``` ... ```
-    # If multiple code fences exist, prefer the largest JSON-like block
-    fences = re.findall(r'```[\s\S]*?```', text)
-    if fences:
-        # choose fence with largest number of braces inside (likely the JSON)
-        best = max(fences, key=lambda f: f.count('{'))
-        inner = re.sub(r'^```\w*\n?', '', best)
-        inner = re.sub(r'\n?```$', '', inner)
-        return inner.strip()
-
-    # Also strip inline backticks if present
-    text = text.replace('`', '')
-    return text.strip()
-
-
-def extract_json_string(text: str) -> Optional[str]:
-    """Attempt to find the most plausible JSON object inside text."""
-    if not text:
-        return None
-    # First try to find a top-level JSON object
-    m = re.search(r'(\{[\s\S]*\})', text)
-    if m:
-        return m.group(1).strip()
-
-    # Fall back to a looser pattern (arrays included)
-    m = re.search(r'(\[[\s\S]*\])', text)
-    if m:
-        return m.group(1).strip()
-
-    return None
-
-
-class QuizSolver:
-    """
-    Hardened quiz solver that uses both HTML extraction and LLM parsing,
-    validates LLM outputs, and sanitizes answers before submit.
-    """
-
-    def __init__(self):
-        self.llm = LLMClient()
-        self.tools = QuizTools()
-        self.email = os.getenv("STUDENT_EMAIL")
-        self.secret = os.getenv("SECRET_KEY")
-        self.scraper = WebScraper()
-        self.file_handler = FileHandler()
-        self.processor = DataProcessor()
-
-
-    async def solve_quiz_chain(self, initial_url: str) -> Dict[str, Any]:
-        current_url = initial_url
-        quizzes_solved = 0
-        max_quizzes = 10  # safety
-
-        while current_url and quizzes_solved < max_quizzes:
-            logger.info(f"Solving quiz {quizzes_solved + 1}: {current_url}")
-            try:
-                result = await self.solve_single_quiz(current_url)
-                quizzes_solved += 1
-                current_url = result.get("next_url")
-                if not current_url:
-                    logger.info("No more quizzes in chain")
-                    break
-            except Exception as e:
-                logger.error(f"Error solving quiz: {str(e)}", exc_info=True)
-                return {
-                    "message": f"Failed at quiz {quizzes_solved + 1}: {str(e)}",
-                    "quizzes_solved": quizzes_solved,
-                }
-
-        return {
-            "message": f"Successfully completed {quizzes_solved} quiz(es)",
-            "quizzes_solved": quizzes_solved,
-        }
-
-    async def solve_single_quiz(self, quiz_url: str) -> Dict[str, Any]:
-        try:
-            logger.info(f"Fetching quiz from: {quiz_url}")
-            quiz_content = await self.tools.fetch_page(quiz_url)
-            logger.info(f"Fetched {len(quiz_content)} characters from quiz page")
-
-            # Prefer deterministic extraction from HTML
-            submit_url_from_html = self._extract_submit_url_from_html(quiz_content)
-
-            logger.info("Parsing quiz instructions via LLM...")
-            instructions = await self.parse_quiz(quiz_content)
-            logger.info(f"Parsed instructions: {instructions}")
-
-            # If HTML provided a submit action, prefer it
-            submit_url = None
-            if submit_url_from_html:
-                submit_url = submit_url_from_html
-                logger.info(f"Found submit URL in HTML: {submit_url}")
-
-            # Otherwise, take from LLM instructions (but validate)
-            if not submit_url:
-                submit_url = instructions.get("submit_url")
-
-            if not submit_url or str(submit_url).lower() == "none":
-                raise ValueError(f"No submit_url found in HTML or LLM output: {submit_url}")
-
-            # Validate submit_url doesn't contain nonsense like 'origin + /submit'
-            if any(token in str(submit_url).lower() for token in ["origin", "+", "current"]):
-                raise ValueError(f"Invalid submit_url returned by LLM: {submit_url}")
-
-            # Convert relative to absolute
-            submit_url = urljoin(quiz_url, submit_url)
-
-            logger.info("Executing solution...")
-            answer = await self.execute_solution(instructions)
-            logger.info(f"Generated raw answer: {answer}")
-
-            logger.info(f"Submitting answer to: {submit_url}")
-            self.current_quiz_url = quiz_url
-
-            result = await self.submit_answer(submit_url, answer)
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in solve_single_quiz: {str(e)}", exc_info=True)
-            raise
-
-    async def parse_quiz(self, html_content: str) -> Dict[str, Any]:
-        """
-        Use an LLM to parse the quiz page but with strict instructions to not
-        invent URLs or make guesses. If possible, the caller should prefer
-        HTML-extracted submit URL over the LLM value.
-        """
-        # Shorten HTML content so we don't exceed context too much
-        sample = html_content[:12000]
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Parse this quiz page and extract the information.\n\n"
-                    "Return ONLY a valid JSON object (no explanation, no markdown) with these keys:\n"
-                    "- task: description of what to do\n"
-                    "- data_source: URL or description of data to fetch (or \"none\")\n"
-                    "- analysis_type: what kind of analysis\n"
-                    "- answer_format: expected format (number, string, json, base64, etc.)\n"
-                    "- submit_url: EXACT submit endpoint as found in the HTML (e.g. /submit or https://site/submit).\n"
-                    "   IMPORTANT: DO NOT GUESS. If the submit URL is not present in the HTML, return \"none\".\n"
-                    "- payload_template: sample JSON structure for submission (if available)\n\n"
-                    "HTML Content:\n"
-                    f"{sample}\n\n"
-                    "Response must be pure JSON only, starting with { and ending with }."
-                ),
-            },
-        ]
-
-        response = await self.llm.chat(messages, temperature=0.0)
-        response = response.strip()
-
-        # remove code fences if the model wrapped the JSON in them
-        response = clean_code_fences(response)
-
-        try:
-            parsed = json.loads(response)
-            logger.info("Successfully parsed JSON from LLM response")
-            return parsed
-        except json.JSONDecodeError:
-            # Try to extract JSON object from noisy text
-            json_str = extract_json_string(response)
-            if json_str:
-                try:
-                    parsed = json.loads(json_str)
-                    logger.info("Extracted JSON using fallback regex")
-                    return parsed
-                except Exception:
-                    logger.exception("Fallback JSON extraction failed")
-
-        raise ValueError("Could not parse quiz instructions from LLM response")
-
-    async def execute_solution(self, instructions: Dict[str, Any]) -> Any:
-        """
-        Execute the required task. Enforce that the LLM returns the answer without
-        Markdown code-blocks and in the requested format.
-        """
-        task = instructions.get("task", "")
-        data_source = instructions.get("data_source", "")
-        analysis_type = instructions.get("analysis_type", "")
-        answer_format = instructions.get("answer_format", "string")
-
-        # Step 1: Fetch data if needed
-        data = None
-        if data_source and isinstance(data_source, str) and data_source.startswith("http"):
-            data = await self.tools.fetch_data(data_source)
-        else:
-            logger.info("No external data source needed or not a http URL")
-
-        # Step 2: Ask LLM to solve the task with strict formatting instructions
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Task: {task}\n"
-                    f"Analysis Type: {analysis_type}\n"
-                    f"Expected Answer Format: {answer_format}\n\n"
-                    "Important instructions:\n"
-                    "- Provide ONLY the final answer in the required format. No explanations.\n"
-                    "- Do NOT wrap the answer in code fences or backticks. No markdown.\n"
-                    "- If the expected format is JSON, return a raw JSON object (not a string).\n"
-                    "- If you cannot compute the answer from the provided information, return the string \"none\".\n\n"
-                    f"{f'Here is the data: {str(data)[:4000]}' if data else ''}\n\n"
-                    "Answer:"
-                ),
-            },
-        ]
-
-        # CASE 1: answer_format = string AND task = scrape secret
-        if instructions["answer_format"].lower() == "string" and "scrape" in instructions["task"].lower():
-            html_text = await self.scraper.scrape_text(self.current_quiz_url)
-            secret = self._extract_secret_from_text(html_text)
-            return secret
-
-        # DEFAULT: LLM fallback
-        raw_answer = await self.llm.chat(messages, temperature=0.0)
-
-        raw_answer = clean_code_fences(raw_answer)
-
-        # Convert to proper type according to answer_format
-        if answer_format.lower() == "number":
-            m = re.search(r'[-+]?[0-9]*\.?[0-9]+', raw_answer)
-            if m:
-                num_str = m.group(0)
-                return float(num_str) if '.' in num_str else int(num_str)
-            else:
-                return raw_answer
-
-        if answer_format.lower() == "json":
-            # Attempt to extract JSON and parse
-            json_str = extract_json_string(raw_answer)
-            if json_str:
-                try:
-                    parsed = json.loads(json_str)
-                    return parsed
-                except Exception:
-                    logger.exception("Failed to parse JSON answer from LLM output")
-                    return raw_answer
-            else:
-                logger.warning("No JSON found in LLM response for json answer_format")
-                return raw_answer
-
-        return raw_answer
-
-    def _extract_submit_url_from_html(self, html: str) -> Optional[str]:
-        """Attempt to get the form action or script-defined submit URL directly from HTML."""
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            # Look for <form action>
-            form = soup.find("form", action=True)
-            if form and form.get("action"):
-                return form.get("action").strip()
-
-            # Look for fetch(".../submit")
-            scripts = "\n".join(s.get_text() for s in soup.find_all("script"))
-            m = re.search(r"fetch\(\s*['\"]([^'\"]+/submit)['\"]", scripts)
-            if m:
-                return m.group(1)
-
-            # meta tag fallback
-            meta = soup.find("meta", attrs={"name": "submit-url"})
-            if meta and meta.get("content"):
-                return meta.get("content").strip()
-
-        except Exception:
-            logger.exception("Failed to extract submit URL from HTML")
-
-        return None
-
-    async def submit_answer(self, submit_url: str, answer: Any) -> Dict[str, Any]:
-        """Submit the answer payload to the quiz endpoint. Accept answer as dict or scalar."""
-        payload = {
-            "email": self.email,
-            "secret": self.secret,
-            "url": self.current_quiz_url,
-            "answer": answer,
-        }
-
-        logger.info(f"Submitting to {submit_url}: {payload}")
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(submit_url, json=payload)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                body = None
-                try:
-                    body = response.json()
-                except Exception:
-                    body = response.text
-                logger.error(f"Submission failed {response.status_code}: {body}")
-                raise
-
-            result = response.json()
-            logger.info(f"Submission result: {result}")
-
-            return {
-                "correct": result.get("correct", False),
-                "next_url": result.get("url"),
-                "message": result.get("message", ""),
-            }
-    
-    def _extract_secret_from_text(self, text: str) -> str:
-        """
-        Extracts the secret code from HTML text.
-        Usually visible as: SECRET: ABCD1234
-        """
-        match = re.search(r"[A-Z0-9]{6,}", text)
-        return match.group(0) if match else "UNKNOWN"
-'''
-
-import httpx
-import re
-import time
 from urllib.parse import urljoin
+
 
 BASE = "https://tds-llm-analysis.s-anand.net"
 
-EMAIL = "YOUR_EMAIL_HERE"
-SECRET = "YOUR_SECRET_HERE"
 
-client = httpx.Client(timeout=10)
+class QuizSolver:
 
+    def __init__(self):
+        # Async HTTP client
+        self.client = httpx.AsyncClient(timeout=10)
 
-def fetch_page(url: str) -> str:
-    """GET the quiz step page."""
-    full = urljoin(BASE, url)
-    print(f"\n[GET] {full}")
-    r = client.get(full)
-    r.raise_for_status()
-    return r.text
+    # ----------------------------------------------------------------------
+    async def fetch_page(self, url: str) -> str:
+        """GET the quiz step page."""
+        full = urljoin(BASE, url)
+        r = await self.client.get(full)
+        r.raise_for_status()
+        return r.text
 
+    # ----------------------------------------------------------------------
+    def extract_answer(self, html: str) -> str:
+        """
+        Extract the answer from the page.
+        Supports:
+        - <code>ANSWER</code>
+        - Answer: XYZ
+        - answer = XYZ
+        """
+        # Try <code>ANSWER</code>
+        m = re.search(r"<code>(.*?)</code>", html, re.S)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
 
-def extract_answer(html: str) -> str:
-    """
-    Extract the answer from the page.
-    Supports formats:
-    - <code>ANSWER</code>
-    - Answer: XYZ
-    - JSON hidden patterns
-    """
-    # Try <code>ANSWER</code>
-    m = re.search(r"<code>(.*?)</code>", html, re.S)
-    if m:
-        ans = m.group(1).strip()
-        if ans:
-            return ans
+        # Try “Answer: …”
+        m = re.search(r"Answer[: ]+</?[^>]*>(.*?)<", html, re.I)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
 
-    # Try “Answer: …”
-    m = re.search(r"Answer[: ]+</?[^>]*>(.*?)<", html, re.I)
-    if m:
-        ans = m.group(1).strip()
-        if ans:
-            return ans
+        # Try plain text "answer = xyz"
+        m = re.search(r"answer\s*=\s*([^\s<]+)", html, re.I)
+        if m:
+            return m.group(1).strip()
 
-    # Try plain text "Answer = XYZ"
-    m = re.search(r"answer\s*=\s*([^\s<]+)", html, re.I)
-    if m:
-        return m.group(1).strip()
+        raise ValueError("Answer not found in page")
 
-    raise ValueError("Answer not found in page")
+    # ----------------------------------------------------------------------
+    async def submit(self, url: str, email: str, secret: str, answer: str) -> dict:
+        """Always POST JSON to /submit."""
+        payload = {
+            "email": email,
+            "secret": secret,
+            "url": url,
+            "answer": answer
+        }
 
+        r = await self.client.post(f"{BASE}/submit", json=payload)
+        r.raise_for_status()
+        return r.json()
 
-def submit(url: str, answer: str) -> dict:
-    """Always POST JSON to /submit — NEVER GET."""
-    payload = {
-        "email": EMAIL,
-        "secret": SECRET,
-        "url": url,
-        "answer": answer
-    }
+    # ----------------------------------------------------------------------
+    async def solve_step(self, url: str, email: str, secret: str) -> str | None:
+        """Fetch → Extract → Submit → Return next URL."""
+        html = await self.fetch_page(url)
+        answer = self.extract_answer(html)
+        resp = await self.submit(url, email, secret, answer)
 
-    print(f"[POST] /submit  answer={answer}")
-    r = client.post(f"{BASE}/submit", json=payload)
-    r.raise_for_status()
-    return r.json()
+        if resp.get("correct") and resp.get("next"):
+            return resp["next"]
+        return None
 
+    # ----------------------------------------------------------------------
+    async def solve_quiz_chain(self, start_url: str, email=None, secret=None):
+        """
+        Main chain solver.
+        FastAPI passes email & secret through request model, not via environment.
+        """
+        if email is None or secret is None:
+            # caller did not pass email/secret → raise error
+            raise ValueError("Email and secret must be provided")
 
-def solve_step(url: str) -> str | None:
-    """Fetch page → Extract answer → Submit → Return next URL."""
-    html = fetch_page(url)
-    answer = extract_answer(html)
+        url = start_url
+        count = 0
+        visited = set()
 
-    resp = submit(url, answer)
-    print("Response:", resp)
+        while url and url not in visited:
+            visited.add(url)
+            count += 1
 
-    if resp.get("correct") and resp.get("next"):
-        return resp["next"]
-    return None
+            try:
+                next_url = await self.solve_step(url, email, secret)
+            except Exception as e:
+                return {
+                    "message": f"Error at step {count}: {str(e)}",
+                    "quizzes_solved": count - 1
+                }
 
+            if not next_url:
+                return {
+                    "message": "Final quiz solved.",
+                    "quizzes_solved": count
+                }
 
-def main():
-    url = "/project2"
+            url = next_url
 
-    seen = set()
-    step = 1
-
-    while url and url not in seen:
-        print(f"\n========== Step {step}: {url} ==========")
-        seen.add(url)
-
-        try:
-            next_url = solve_step(url)
-        except Exception as e:
-            print("❌ Error:", e)
-            break
-
-        if not next_url:
-            print("\n🎉 No next URL returned — final step reached!")
-            break
-
-        url = next_url
-        step += 1
-        time.sleep(0.4)
-
-
-if __name__ == "__main__":
-    main()
-
+        return {
+            "message": "Reached a repeated URL or stopped.",
+            "quizzes_solved": count
+        }
