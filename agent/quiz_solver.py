@@ -1,4 +1,4 @@
-# ====================================================================
+'''# ====================================================================
 # agent/quiz_solver.py
 # Hybrid async QuizSolver: LLM-assisted + deterministic handlers
 # ====================================================================
@@ -332,5 +332,138 @@ class QuizSolver:
         return {"message": f"Stopped after {solved} steps (max reached?).", "quizzes_solved": solved}
 
     # ----------------------
+    async def close(self):
+        await self.client.aclose() '''
+
+# ====================================================================
+# agent/quiz_solver.py
+# ====================================================================
+import re
+import json
+import logging
+from typing import Any, Dict, Optional
+from urllib.parse import urljoin, urlparse
+
+import httpx
+
+from agent.llm_client import LLMClient
+from agent.prompts import SYSTEM_PROMPT
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+DEFAULT_BASE = "https://tds-llm-analysis.s-anand.net"
+SUBMIT_PATH = "/submit"
+
+
+def clean_code_fences(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    m = re.search(r"```(?:\w*\n)?([\s\S]*?)```", text)
+    return m.group(1).strip() if m else text.replace("`", "").strip()
+
+
+def find_origin_from_url(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else DEFAULT_BASE
+
+
+class QuizSolver:
+    def __init__(self, timeout: float = 30.0):
+        self.llm = LLMClient()
+        self.client = httpx.AsyncClient(timeout=timeout)
+
+    async def fetch_page(self, url: str) -> str:
+        if not urlparse(url).netloc:
+            url = urljoin(DEFAULT_BASE, url)
+        r = await self.client.get(url)
+        r.raise_for_status()
+        return r.text
+
+    # ---------- Heuristic for project2-uv ----------
+    def _build_uv_command(self, origin: str, email: str) -> str:
+        url = f"{origin}/project2/uv.json?email={email}"
+        return f'uv http get {url} -H "Accept: application/json"'
+
+    async def compute_answer(self, page_url: str, html: str, email: str) -> Any:
+        if re.search(r"\buv\s+http\s+get\b", html, re.I):
+            origin = find_origin_from_url(page_url)
+            return self._build_uv_command(origin, email)
+
+        # fallback → LLM
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Return ONLY the final answer in the required format.\n\n"
+                    f"HTML:\n{html[:12000]}"
+                ),
+            },
+        ]
+        raw = await self.llm.chat(messages, temperature=0.0)
+        return clean_code_fences(raw)
+
+    async def submit_answer(
+        self, quiz_page_url: str, email: str, secret: str, answer: Any
+    ) -> Dict[str, Any]:
+
+        origin = find_origin_from_url(quiz_page_url)
+        submit_url = urljoin(origin, SUBMIT_PATH)
+
+        payload = {
+            "email": email,
+            "secret": secret,
+            "url": quiz_page_url,
+            "answer": answer,
+        }
+
+        # ✅ SAFE LOGGING (no f-string dict interpolation)
+        logger.info(
+            "POST %s | email=%s | url=%s | answer_preview=%s",
+            submit_url,
+            email,
+            quiz_page_url,
+            str(answer)[:80],
+        )
+
+        r = await self.client.post(submit_url, json=payload)
+        r.raise_for_status()
+        j = r.json()
+
+        return {
+            "correct": j.get("correct", False),
+            "next_url": j.get("url") or j.get("next") or j.get("next_url"),
+            "raw": j,
+        }
+
+    async def solve_single_quiz(self, url: str, email: str, secret: str):
+        html = await self.fetch_page(url)
+        answer = await self.compute_answer(url, html, email)
+        return await self.submit_answer(url, email, secret, str(answer).strip())
+
+    async def solve_quiz_chain(self, start_url: str, email: str, secret: str):
+        current = start_url
+        visited = set()
+        solved = 0
+
+        while current:
+            if current in visited:
+                return {"message": "Loop detected", "quizzes_solved": solved}
+
+            visited.add(current)
+            try:
+                res = await self.solve_single_quiz(current, email, secret)
+            except Exception as e:
+                return {"message": f"Failed at step {solved+1}: {e}", "quizzes_solved": solved}
+
+            solved += 1
+            current = res.get("next_url")
+
+            if not current:
+                return {"message": "Final quiz solved.", "quizzes_solved": solved}
+
+        return {"message": "Done", "quizzes_solved": solved}
+
     async def close(self):
         await self.client.aclose()
