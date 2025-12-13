@@ -12,6 +12,7 @@ import httpx
 
 from agent.llm_client import LLMClient
 from agent.prompts import SYSTEM_PROMPT, TASK_PLANNING_PROMPT
+from agent.tool_registry import registry
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -99,32 +100,113 @@ class QuizSolver:
             },
         ]
 
-        logger.info("Asking LLM to parse quiz page...")
-        resp = await self.llm.chat(messages, temperature=0.0)
-        resp = clean_code_fences(resp)
+        logger.info("Asking LLM to parse quiz page (tools available)...")
+
+        # Provide tools metadata so the model may request data or parsing
+        tools_meta = registry.get_tools_for_model()
+
+        # Use tool-enabled chat; the model may ask to call a tool (function call)
         try:
-            parsed = json.loads(resp)
-            logger.info("LLM returned valid JSON parsing.")
-            return parsed
+            resp = await self.llm.chat_with_tools(messages, tools_meta, temperature=0.0)
         except Exception:
-            # fallback: try to extract JSON object from noisy text
-            m = re.search(r'(\{[\s\S]*\})', resp)
-            if m:
+            # If tool-enabled API fails, fallback to simple chat
+            logger.exception("Tool-enabled LLM call failed; falling back to simple chat.")
+            resp_text = await self.llm.chat(messages, temperature=0.0)
+            resp_text = clean_code_fences(resp_text)
+            try:
+                parsed = json.loads(resp_text)
+                return parsed
+            except Exception:
+                m = re.search(r'(\{[\s\S]*\})', resp_text)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(1))
+                        return parsed
+                    except Exception:
+                        logger.exception("Failed to parse JSON from LLM fallback.")
+                logger.warning("LLM parsing failed; returning minimal inferred structure.")
+                return {
+                    "task": "unknown",
+                    "data_source": "none",
+                    "analysis_type": "none",
+                    "answer_format": "string",
+                    "submit_url": "none",
+                    "payload_template": "none",
+                }
+
+        # If the tool-enabled response contains direct content and no tool calls, parse it
+        content = resp.get("content")
+        tool_calls = resp.get("tool_calls") or []
+
+        if not tool_calls:
+            text = clean_code_fences(content or "")
+            try:
+                parsed = json.loads(text)
+                logger.info("LLM returned valid JSON parsing (no tools).")
+                return parsed
+            except Exception:
+                m = re.search(r'(\{[\s\S]*\})', text)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(1))
+                        return parsed
+                    except Exception:
+                        logger.exception("Failed to parse JSON from LLM fallback.")
+
+        # If the model requested a tool, execute the first tool call and provide its result back
+        if tool_calls:
+            # use only first call for now
+            tc = tool_calls[0]
+            # groq's structure may vary; support common keys
+            tool_name = tc.get("name") or tc.get("tool") or tc.get("tool_name")
+            arguments = tc.get("arguments") or tc.get("arguments_json") or tc.get("args") or {}
+            # Try normalize arguments to dict
+            args = {}
+            if isinstance(arguments, str):
                 try:
-                    parsed = json.loads(m.group(1))
-                    return parsed
+                    args = json.loads(arguments)
                 except Exception:
-                    logger.exception("Failed to parse JSON from LLM fallback.")
-            # final fallback: return minimal structure
-            logger.warning("LLM parsing failed; returning minimal inferred structure.")
-            return {
-                "task": "unknown",
-                "data_source": "none",
-                "analysis_type": "none",
-                "answer_format": "string",
-                "submit_url": "none",
-                "payload_template": "none"
-            }
+                    # best-effort parse: url=...
+                    parts = [p.strip() for p in arguments.split("&") if p.strip()]
+                    for p in parts:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            args[k] = v
+            elif isinstance(arguments, dict):
+                args = arguments
+
+            try:
+                tool_result = await registry.execute(tool_name, args)
+            except Exception:
+                logger.exception("Tool execution failed; continuing without tool result.")
+                tool_result = None
+
+            # Provide the tool output back to the model to ask for final JSON
+            messages.append({"role": "system", "content": f"Tool {tool_name} returned: {json.dumps(tool_result)}"})
+            final = await self.llm.chat(messages, temperature=0.0)
+            final = clean_code_fences(final)
+            try:
+                parsed = json.loads(final)
+                return parsed
+            except Exception:
+                m = re.search(r'(\{[\s\S]*\})', final)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(1))
+                        return parsed
+                    except Exception:
+                        logger.exception("Failed to parse JSON from final LLM output.")
+
+        # final fallback
+        logger.warning("LLM parsing yielded no usable JSON; returning minimal inferred structure.")
+        return {
+            "task": "unknown",
+            "data_source": "none",
+            "analysis_type": "none",
+            "answer_format": "string",
+            "submit_url": "none",
+            "payload_template": "none",
+        }
 
     # ----------------------
     def _heuristic_detect_uv_get(self, html: str) -> Optional[Dict[str, str]]:

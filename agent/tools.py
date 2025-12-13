@@ -11,6 +11,7 @@ import io
 import base64
 from utils.file_handler import FileHandler
 from utils.data_processor import DataProcessor
+from agent.tool_registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -100,3 +101,40 @@ class QuizTools:
         
         text = soup.get_text(separator="\n", strip=True)
         return text
+
+
+# Instantiate and register tools for LLM function-calling
+_quiz_tools = QuizTools()
+
+registry.register_fn(
+    "fetch_page",
+    _quiz_tools.fetch_page,
+    "Fetch and render a web page (handles base64 encoded content).",
+    {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"],
+    },
+)
+
+registry.register_fn(
+    "fetch_data",
+    _quiz_tools.fetch_data,
+    "Fetch data (JSON, CSV, PDF, Excel) from a URL and return parsed content.",
+    {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"],
+    },
+)
+
+registry.register_fn(
+    "parse_html",
+    _quiz_tools.parse_html,
+    "Parse HTML and return visible text content.",
+    {
+        "type": "object",
+        "properties": {"html": {"type": "string"}},
+        "required": ["html"],
+    },
+)
