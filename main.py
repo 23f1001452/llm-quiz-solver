@@ -78,14 +78,13 @@ async def solve_quiz(request: QuizRequest):
         solver = QuizSolver()
         
         # Solve quiz with timeout
+        solver = QuizSolver()
         result = await asyncio.wait_for(
-    solver.solve_quiz_chain(
-        request.url,
-        email=request.email,
-        secret=request.secret
-    ),
+    solver.solve_quiz_chain(request.url, email=request.email, secret=request.secret),
     timeout=TIMEOUT_SECONDS
 )
+        await solver.close()
+
         
         logger.info(f"Successfully solved {result['quizzes_solved']} quiz(es)")
         
