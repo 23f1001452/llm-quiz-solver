@@ -223,7 +223,16 @@ class QuizSolver:
             "answer": answer
         }
 
-        logger.info(f"POST {submit_url} payload={{{'email': email, 'url': quiz_page_url, 'answer': str(answer)[:80]+'...' if isinstance(answer, str) and len(answer)>80 else answer}}}")
+        preview = {
+    "email": email,
+    "url": quiz_page_url,
+    "answer": (
+        str(answer)[:80] + "..."
+        if isinstance(answer, str) and len(answer) > 80
+        else answer
+    ),
+}
+        logger.info(f"POST {submit_url} payload={preview}")
         r = await self.client.post(submit_url, json=payload)
         try:
             r.raise_for_status()
